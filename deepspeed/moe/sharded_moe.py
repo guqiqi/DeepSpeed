@@ -398,7 +398,8 @@ class TopKGate(Module):
                  drop_tokens: bool = True,
                  use_rts: bool = True,
                  ep_group: Union[torch.distributed.ProcessGroup, None] = None,
-                 top2_2nd_expert_sampling: bool = True) -> None:
+                 top2_2nd_expert_sampling: bool = True,
+                 wall_clock_breakdown: bool = False) -> None:
         super().__init__()
 
         # Only top-1 and top-2 are supported at the moment.
@@ -412,7 +413,7 @@ class TopKGate(Module):
         self.min_capacity = min_capacity
         self.noisy_gate_policy = noisy_gate_policy
         self.timers = SynchronizedWallClockTimer()
-        self.wall_clock_breakdown = False
+        self.wall_clock_breakdown = wall_clock_breakdown
         self.gate_time = 0.0
         self.drop_tokens = drop_tokens
         self.use_rts = use_rts
@@ -476,7 +477,8 @@ class MOELayer(Base):
                  ep_group_name,
                  ep_size,
                  num_local_experts: int,
-                 use_tutel: bool = False) -> None:
+                 use_tutel: bool = False,
+                 wall_clock_breakdown: bool = False) -> None:
         super().__init__()
         self.gate = gate
         self.experts = experts
@@ -486,9 +488,13 @@ class MOELayer(Base):
         self.num_local_experts = num_local_experts
         self.time_falltoall = 0.0
         self.time_salltoall = 0.0
+        self.time_expert_compute = 0.0
+        self.time_drop_tokens = 0.0
+        self.time_einsum_1 = 0.0
+        self.time_einsum_2 = 0.0
         self.time_moe = 0.0
         self.timers = SynchronizedWallClockTimer()
-        self.wall_clock_breakdown = False
+        self.wall_clock_breakdown = wall_clock_breakdown
 
         self.use_tutel = use_tutel and TUTEL_INSTALLED and gate.k == 1
 
@@ -522,16 +528,24 @@ class MOELayer(Base):
             self.l_aux, C, E, indices_, locations_, gates_, self.exp_counts = self.gate(reshaped_input, input[1], True)
             S, M = reshaped_input.size(0), reshaped_input.size(1)
 
+            if self.wall_clock_breakdown:
+                self.timers('einsum-1').start()
             if not hasattr(self, '_tutel_dispatcher'):
                 self._tutel_dispatcher = tutel_moe.fast_dispatcher(E, C, M, dispatch_dtype=reshaped_input.dtype)
             self._tutel_dispatcher.update(indices_, locations_, gates_, capacity=C)
             dispatched_input = self._tutel_dispatcher.encode(reshaped_input)
+            if self.wall_clock_breakdown:
+                self.timers('einsum-1').stop()
         else:
             self.l_aux, combine_weights, dispatch_mask, self.exp_counts = self.gate(reshaped_input, input[1])
+            if self.wall_clock_breakdown:
+                self.timers('einsum-1').start()
             dispatched_input = einsum("sec,sm->ecm", dispatch_mask.type_as(input[0]), reshaped_input)
+            if self.wall_clock_breakdown:
+                self.timers('einsum-1').stop()
 
         if self.wall_clock_breakdown:
-            self.timers(FIRST_ALLTOALL_TIMER).start()
+            self.timers('drop-tokens').start()
 
         if groups._get_expert_model_parallel_world_size() == 1:
             # If the non-expert is tensor-parallel, it will create
@@ -542,6 +556,11 @@ class MOELayer(Base):
             # reducing the all-to-all communication volume.
             dispatched_input = drop_tokens(dispatched_input, dim=1)
 
+        if self.wall_clock_breakdown:
+            self.timers('drop-tokens').stop()
+
+        if self.wall_clock_breakdown:
+            self.timers(FIRST_ALLTOALL_TIMER).start()
         dispatched_input = _AllToAll.apply(self.ep_group, dispatched_input)
 
         if self.wall_clock_breakdown:
@@ -550,8 +569,15 @@ class MOELayer(Base):
 
         # Re-shape after all-to-all: ecm -> gecm
         dispatched_input = dispatched_input.reshape(self.ep_size, self.num_local_experts, -1, d_model)
+        
+        if self.wall_clock_breakdown:
+            self.timers('compute').start()
 
         expert_output = self.experts(dispatched_input)
+        
+        if self.wall_clock_breakdown:
+            self.timers('compute').stop()
+            self.time_expert_compute = self.timers('compute').elapsed(reset=False)
 
         if self.wall_clock_breakdown:
             self.timers(SECOND_ALLTOALL_TIMER).start()
@@ -571,15 +597,24 @@ class MOELayer(Base):
             # non-expert of the next layer.
             expert_output = gather_tokens(expert_output, dim=1)
 
+        if self.wall_clock_breakdown:
+            self.timers('einsum-2').start()
+            
         if self.use_tutel:
             combined_output = self._tutel_dispatcher.decode(expert_output.view(E * C, M))
         else:
             combined_output = einsum("sec,ecm->sm", combine_weights.type_as(input[0]), expert_output)
+            
+        if self.wall_clock_breakdown:
+            self.timers('einsum-2').stop()
 
         a = combined_output.reshape(input[0].shape)
 
         if self.wall_clock_breakdown:
             self.timers(MOE_TIMER).stop()
             self.time_moe = self.timers(MOE_TIMER).elapsed(reset=False)
+            self.time_drop_tokens = self.timers('drop-tokens').elapsed(reset=False)
+            self.time_einsum_1 = self.timers('einsum-1').elapsed(reset=False)
+            self.time_einsum_2 = self.timers('einsum-2').elapsed(reset=False)
 
         return a
