@@ -16,11 +16,11 @@ class BaseTransformerMoEContainer(BaseTransformerContainer):
         # Call the init function of the parent class to initialize the tensors and configs from parent class
         super().__init__(**kwargs)
 
-        self.num_experts = self.policy.get_num_experts()
+        self.local_ep_size = self.policy.get_num_local_experts()
         self.ep_world_size = dist.get_world_size()
-        self.local_ep_size = 1 if self.num_experts < self.ep_world_size else self.num_experts // self.ep_world_size
+        self.num_experts = self.local_ep_size * self.ep_world_size
 
-        self.layer_norm_eps = self.config.layer_norm_eps if hasattr(self.config, 'layer_norm_eps') else 1e-12,
+        self.layer_norm_eps = self.config.layer_norm_eps if hasattr(self.config, 'layer_norm_eps') else 1e-12
 
         # MoE models will have a list of mlp related tensors
         self._h4h_w = []
@@ -45,10 +45,9 @@ class BaseTransformerMoEContainer(BaseTransformerContainer):
             hidden_size=self.hidden_size,
             heads=self.num_attention_heads,
             layer_norm_eps=self.layer_norm_eps,
-            fp16=self.fp16,
+            dtype=self.dtype,
             pre_layer_norm=self.pre_layer_norm,
             mp_size=self.mp_size,
-            q_int8=self.quantize,
             moe_experts=self.local_ep_size,
             global_experts=self.num_experts,
             mlp_type=self.config.moe.type,
@@ -101,18 +100,18 @@ class BaseTransformerMoEContainer(BaseTransformerContainer):
         self.mlp_mp()
 
     def mlp_mp(self):
-        gpu_index = dist.get_rank()
+        # gpu_index = dist.get_rank()
         for ep_index in range(self.local_ep_size):
             # mlp inter
-            self.module.mlp[ep_index].inter_w.data = self._h4h_w[gpu_index * self.local_ep_size + ep_index].to(
+            self.module.mlp[ep_index].inter_w.data = self._h4h_w[ep_index].to(
                 get_accelerator().current_device_name())
-            self.module.mlp[ep_index].inter_b.data = self._h4h_b[gpu_index * self.local_ep_size + ep_index].to(
+            self.module.mlp[ep_index].inter_b.data = self._h4h_b[ep_index].to(
                 get_accelerator().current_device_name())
 
             # mlp output
-            self.module.mlp[ep_index].output_w.data = self._4hh_w[gpu_index * self.local_ep_size + ep_index].to(
+            self.module.mlp[ep_index].output_w.data = self._4hh_w[ep_index].to(
                 get_accelerator().current_device_name())
-            self.module.mlp[ep_index].output_b.data = self._4hh_b[gpu_index * self.local_ep_size + ep_index].to(
+            self.module.mlp[ep_index].output_b.data = self._4hh_b[ep_index].to(
                 get_accelerator().current_device_name())
 
     def copy_data_to_new_module(self):

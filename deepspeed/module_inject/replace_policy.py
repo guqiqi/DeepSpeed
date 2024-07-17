@@ -11,6 +11,7 @@ from .containers import HFGPTNEOLayerPolicy
 from .containers import GPTNEOXLayerPolicy
 from .containers import HFOPTLayerPolicy
 from .containers import MegatronLayerPolicy
+from .containers import MegatronMoELayerPolicy
 from .containers import HFDistilBertLayerPolicy
 from .containers import HFCLIPLayerPolicy
 from .containers import LLAMALayerPolicy
@@ -24,6 +25,10 @@ replace_policies = [
     HFBertLayerPolicy, HFGPTNEOLayerPolicy, GPTNEOXLayerPolicy, HFGPTJLayerPolicy, MegatronLayerPolicy,
     HFGPT2LayerPolicy, BLOOMLayerPolicy, HFOPTLayerPolicy, HFCLIPLayerPolicy, HFDistilBertLayerPolicy,
     LLAMALayerPolicy, LLAMA2LayerPolicy, InternLMLayerPolicy
+]
+
+replace_moe_policies = [
+    MegatronMoELayerPolicy
 ]
 
 # non-transformer-based policies

@@ -16,6 +16,7 @@ def policy_to_ds_container(**kwargs):
     from .containers import GPTNEOXLayerPolicy, DS_GPTNEOXContainer
     from .containers import HFOPTLayerPolicy, DS_OPTContainer
     from .containers import MegatronLayerPolicy, DS_MegatronGPTContainer
+    from .containers import MegatronMoELayerPolicy, DS_MegatronGPTMoEContainer
     from .containers import HFDistilBertLayerPolicy, DS_DistilBERTContainer
     from .containers import LLAMALayerPolicy, DS_LLAMAContainer
     from .containers import LLAMA2LayerPolicy, DS_LLAMA2Container
@@ -30,6 +31,7 @@ def policy_to_ds_container(**kwargs):
         GPTNEOXLayerPolicy: DS_GPTNEOXContainer,
         HFOPTLayerPolicy: DS_OPTContainer,
         MegatronLayerPolicy: DS_MegatronGPTContainer,
+        MegatronMoELayerPolicy: DS_MegatronGPTMoEContainer,
         HFDistilBertLayerPolicy: DS_DistilBERTContainer,
         LLAMALayerPolicy: DS_LLAMAContainer,
         LLAMA2LayerPolicy: DS_LLAMA2Container,

@@ -7,6 +7,7 @@ from .base import *
 from .base_moe import *
 from .features.megatron import MegatronContainer
 from deepspeed.model_implementations.transformers.ds_megatron_gpt import DeepSpeedMegatronGPTInference
+from deepspeed.ops.transformer.inference.moe_inference import DeepSpeedMoEInference
 import torch
 from .megatron_gpt import MegatronLayerPolicy
 from packaging import version as pkg_version
@@ -14,14 +15,16 @@ from packaging import version as pkg_version
 
 class DS_MegatronGPTMoEContainer(MegatronContainer, BaseTransformerMoEContainer):
 
-    def __init__(self, policy, config, model_config, layer_id):
-        super().__init__(policy, config, model_config, layer_id)
+    # 参数列表：policy, config, model_config, layer_id, child
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
 
         # All model specific things should be defined here instead of the base class.
 
     def create_module(self, config=None):
         _config = config if config is not None else self.ds_model_config
-        self.module = DeepSpeedMegatronGPTInference(_config, mp_group=self.mp_group)
+        self.module = DeepSpeedMoEInference(_config, mp_group=self.mp_group)
+        # self.module = DeepSpeedMegatronGPTInference(_config, mp_group=self.mp_group)
         self.module.config.scale_attention = self.scale_attention
 
         if self.megatron_v2:
@@ -37,11 +40,14 @@ class MegatronMoELayerPolicy(MegatronLayerPolicy):
     _orig_layer_class = None
     version = 0
     moe_type = 'standard'
-    num_experts = 1
+    num_local_experts = 1
 
     def __init__(self, client_module, inference=True):
         super().__init__(inference)
         self.client_module = client_module
+        
+        self.num_local_experts = 1 if client_module is None else len(client_module.mlp.deepspeed_moe.experts.deepspeed_experts)
+        
         # we use megatron version to differentiate between the old and new
         # megatron-lm source code
         if MegatronMoELayerPolicy._orig_layer_class is None:
@@ -54,8 +60,8 @@ class MegatronMoELayerPolicy(MegatronLayerPolicy):
                 except ImportError:
                     MegatronMoELayerPolicy._orig_layer_class = None
 
-    def get_num_experts(self):
-        return self.num_experts
+    def get_num_local_experts(self):
+        return self.num_local_experts
 
     def mlp(self, moe_type='standard', enable_training=False):
         # for now, all of this is tightly coupled to megatron-deepspeed moe implementation

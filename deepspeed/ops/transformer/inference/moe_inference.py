@@ -54,8 +54,7 @@ class DeepSpeedMoEInferenceConfig(DeepSpeedInferenceConfig):
                  layer_norm_eps=1e-12,
                  local_rank=-1,
                  mp_size=1,
-                 fp16=False,
-                 bf16=False,
+                 dtype=torch.float16,
                  q_int8=False,
                  pre_layer_norm=True,
                  stochastic_mode=False,
@@ -76,10 +75,20 @@ class DeepSpeedMoEInferenceConfig(DeepSpeedInferenceConfig):
                  mlp_type='standard',
                  scale_attn_by_inverse_layer_idx=False):
         super(DeepSpeedMoEInferenceConfig,
-              self).__init__(hidden_size, (intermediate_size if intermediate_size > 0 else 4 * hidden_size), heads,
-                             num_hidden_layers, layer_norm_eps, local_rank, mp_size, fp16, bf16, q_int8,
-                             pre_layer_norm, stochastic_mode, scale_attention, triangular_masking, local_attention,
-                             window_size, return_tuple)
+              self).__init__(hidden_size=hidden_size, 
+                             intermediate_size=(intermediate_size if intermediate_size > 0 else 4 * hidden_size), heads=heads,
+                             num_hidden_layers=num_hidden_layers, 
+                             layer_norm_eps=layer_norm_eps, 
+                             local_rank=local_rank, 
+                             mp_size=mp_size, 
+                             dtype=dtype,
+                             pre_layer_norm=pre_layer_norm, 
+                             stochastic_mode=stochastic_mode, 
+                             scale_attention=scale_attention, 
+                             triangular_masking=triangular_masking, 
+                             local_attention=local_attention,
+                             window_size=window_size, 
+                             return_single_tuple=return_tuple)
         self.moe_experts = moe_experts
         self.k = k
         self.capacity_factor = capacity_factor
@@ -91,6 +100,9 @@ class DeepSpeedMoEInferenceConfig(DeepSpeedInferenceConfig):
         self.global_experts = global_experts
         self.mlp_type = mlp_type
         self.scale_attn_by_inverse_layer_idx = scale_attn_by_inverse_layer_idx
+        
+        self.q_int8 = q_int8
+        self.fp16 = True if dtype == torch.float16 else False
 
     @classmethod
     def from_dict(cls, json_object):
@@ -119,7 +131,17 @@ class DeepSpeedMLPFunction(Function):
             mlp_gemm_func = inference_module.fused_gemm_gelu_fp16 if config.fp16 else \
                                     inference_module.fused_gemm_gelu_fp32
 
-            output = mlp_gemm_func(input, inter_w, inter_b, output_w, config.epsilon, config.pre_layer_norm, async_op)
+            output = mlp_gemm_func(input, inter_w, torch.empty(1), inter_b, output_w, torch.empty(1), config.q_int8, config.transposed_mode)
+            # output = mlp_gemm_func(
+            #     input=input,
+            #     weight=inter_w,
+            #     weight_scale=torch.empty(1),
+            #     bias=inter_b,
+            #     weight_out=output_w,
+            #     weight_out_scale=torch.empty(1),
+            #     q_int8=config.q_int8,
+            #     transposed_mode=config.transposed_mode,
+            # )
         if mp_group is not None and dist.get_world_size(group=mp_group) > 1:
             dist.all_reduce(output, group=mp_group, async_op=async_op)
 
@@ -222,24 +244,35 @@ class DeepSpeedMoEInference(nn.Module):
         self.mlp = nn.ModuleList(
             DeepSpeedMoEMLP(config, quantize_scales, quantize_groups, merge_count, mlp_extra_grouping, expert_mp_group)
             for i in range(self.config.moe_experts))
-
+        
+        self.ep_group = ep_group
+        self.mp_group = mp_group
+        self.expert_mp_group = expert_mp_group
+        
         self.moe_gate = TopKGate(self.config.hidden_size, self.config.global_experts, self.config.k,
                                  self.config.capacity_factor, self.config.eval_capacity_factor,
                                  self.config.min_capacity, self.config.noisy_gate_policy, self.config.drop_tokens,
                                  self.config.use_rts, self.ep_group)
 
-        self.ep_group = ep_group
-        self.mp_group = mp_group
-        self.expert_mp_group = expert_mp_group
-
-        print("DeepSpeed MoE Transformer Inference config is ", self.config.__dict__)
-
         self.bias_residual_func = inference_module.bias_residual_fp16 if self.config.dtype in [torch.float16, torch.int8] else \
                                         inference_module.bias_residual_fp32
-        self.ds_layernorm = inference_module.layer_norm_fp16 if self.config.dtype in [torch.float16, torch.int8] else \
-                                        inference_module.layer_norm_fp32
+        # self.ds_layernorm = inference_module.layer_norm_fp16 if self.config.dtype in [torch.float16, torch.int8] else \
+        #                                 inference_module.layer_norm_fp32
+        self.ds_layernorm = inference_module.layer_norm
         self.einsum_sec_sm_ecm = inference_module.einsum_sec_sm_ecm_fp16 if self.config.dtype in [torch.float16, torch.int8] else \
                                         inference_module.einsum_sec_sm_ecm_fp32
+        
+        try:
+            if config.dtype == torch.float32:
+                self.allocate_workspace = inference_module.allocate_workspace_fp32
+            elif config.dtype == torch.bfloat16:
+                self.allocate_workspace = inference_module.allocate_workspace_bf16
+            else:
+                self.allocate_workspace = inference_module.allocate_workspace_fp32
+            self._alloc_workspace = True
+        except AttributeError:
+            self.allocate_workspace = None
+            self._alloc_workspace = False
 
     def res_coef_func(self, inp, async_op):
         inp = self.vector_matmul_func(inp, self.res_coef, async_op)
@@ -301,6 +334,20 @@ class DeepSpeedMoEInference(nn.Module):
         get_present = (get_present or get_key_value or use_cache)
         input_mask = input_mask if attention_mask is None else attention_mask
         input_type = input.dtype
+        
+         # Allocate memory only on first layer forward
+        if self.config.layer_id == 0 and self._alloc_workspace:
+            self.allocate_workspace(self.config.hidden_size, 
+                                    self.config.heads,
+                                    input.size()[1],
+                                    input.size()[0], 
+                                    DeepSpeedMoEInference.layer_id, 
+                                    self.config.mp_size,
+                                    False,
+                                    dist.get_rank() if dist.is_initialized() else 0, 
+                                    self.config.max_out_tokens,
+                                    self.config.min_out_tokens)
+            self._alloc_workspace = False
 
         if (self.config.dtype in [torch.float16, torch.int8]) and input_type == torch.float:
             input = input.half()

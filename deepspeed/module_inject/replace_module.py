@@ -12,7 +12,7 @@ from deepspeed.ops.transformer.inference.diffusers_attention import DeepSpeedDif
 from deepspeed.ops.transformer.inference.diffusers_transformer_block import DeepSpeedDiffusersTransformerBlock
 from deepspeed.ops.transformer.inference.diffusers_2d_transformer import Diffusers2DTransformerConfig
 from deepspeed.accelerator import get_accelerator
-from .replace_policy import replace_policies, generic_policies
+from .replace_policy import replace_policies, replace_moe_policies, generic_policies
 from .auto_tp import AutoTP, ReplaceWithTensorSlicing, Loading
 from .layers import TensorParallelOcShardConv2d, TensorParallelIcShardConv2d
 
@@ -382,7 +382,13 @@ def replace_transformer_layer(orig_layer_impl, model, checkpoint_dict, config, m
         if 'Yuan' in str(replaced_module):
             conv2d_parallel_shard_weights(replaced_module, dist.get_rank(), dist.get_world_size())
     else:
-        replaced_module = replace_module(model=model,
+        if config.moe.enabled:
+            replaced_module = replace_moe_module(model=model,
+                                         orig_class=orig_layer_impl,
+                                         replace_fn=replace_fn,
+                                         _replace_policy=config.injection_policy_tuple)
+        else:
+            replaced_module = replace_module(model=model,
                                          orig_class=orig_layer_impl,
                                          replace_fn=replace_fn,
                                          _replace_policy=config.injection_policy_tuple)
@@ -620,6 +626,43 @@ def replace_module(model, orig_class, replace_fn, _replace_policy, checkpoint=No
         policy.update({orig_class: (replace_fn, _replace_policy)})
     else:
         for plcy in replace_policies:
+            # instantiate a throw-away policy in order to populate the _orig_layer_class
+            _ = plcy(None)
+            if isinstance(plcy._orig_layer_class, list):
+                for orig_layer_class in plcy._orig_layer_class:
+                    policy.update({orig_layer_class: (replace_fn, plcy)})
+            elif plcy._orig_layer_class is not None:
+                policy.update({plcy._orig_layer_class: (replace_fn, plcy)})
+    assert len(policy.items()) > 0,\
+        "No default policy found! Please specify your policy injection_policy (like {BertLayer:HFBEertLayerPolicy})." +\
+        "You can find some samples here: https://github.com/microsoft/DeepSpeed/blob/master/deepspeed/module_inject/replace_policy.py"
+
+    replaced_module, _ = _replace_module(model, policy, state_dict=sd)
+    return replaced_module
+
+def replace_moe_module(model, orig_class, replace_fn, _replace_policy, checkpoint=None):
+    """ Scan the model for instances of ``orig_clas:`` to replace using ``replace_fn``.
+    Arguments:
+        model (torch.nn.Module): the model to augment
+        orig_class (torch.nn.Module): the module to search for
+        replace_fn (method): a method to convert instances of ``orig_class`` to the
+                             desired type and return a new instance.
+    Returns:
+        A modified ``model``.
+    """
+    sd = None
+    if checkpoint is not None:
+        if checkpoint.endswith(".safetensors"):
+            from safetensors.torch import load_file
+            sd = load_file(checkpoint)
+        else:
+            sd = torch.load(checkpoint, map_location='cpu')
+
+    policy = {}
+    if orig_class is not None:
+        policy.update({orig_class: (replace_fn, _replace_policy)})
+    else:
+        for plcy in replace_moe_policies:
             # instantiate a throw-away policy in order to populate the _orig_layer_class
             _ = plcy(None)
             if isinstance(plcy._orig_layer_class, list):
